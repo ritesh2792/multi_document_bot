@@ -1,0 +1,170 @@
+# Databricks Notebook: LangGraph–powered Product Description Generator
+
+# 1) Install dependencies (notebook‑scoped)
+%pip install --upgrade \
+  databricks-vectorsearch \
+  langchain langchain-openai langgraph openai python-dotenv
+
+# After install completes, restart the Python session:
+# dbutils.library.restartPython()
+
+# 2) Imports & Config
+import os
+import json
+from dotenv import load_dotenv
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, StringType
+
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import HumanMessage
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, START, END
+from langgraph.prebuilt import ToolNode
+from langgraph.graph.message import add_messages
+from langchain_core.messages import AnyMessage
+
+# Initialize
+load_dotenv()
+openai_api_key = os.getenv("OPENAI_API_KEY")
+spark = SparkSession.builder.getOrCreate()
+
+# 3) Tool: Retrieve by Name
+@tool
+def retrieve_products_by_name(query: str) -> str:
+    """Return up to 10 matching items as JSON list"""
+    df = spark.sql(f"""
+      SELECT product_id, name, differentiators, dimensions, overall_reviews
+      FROM your_catalog.your_schema.item_master
+      WHERE lower(name) LIKE lower('%{query}%')
+      LIMIT 10
+    """
+    )
+    results = [row.asDict() for row in df.collect()]
+    return json.dumps(results)
+
+# 4) Tool: Retrieve by ID
+@tool
+def retrieve_product_by_id(product_id: str) -> str:
+    """Return the item details as JSON object"""
+    df = spark.sql(f"""
+      SELECT product_id, name, differentiators, dimensions, overall_reviews
+      FROM your_catalog.your_schema.item_master
+      WHERE product_id = '{product_id}'
+    """
+    )
+    row = df.first()
+    return json.dumps(row.asDict()) if row else json.dumps({})
+
+# 5) Tool: Generate Descriptions
+@tool
+def generate_descriptions(product_json: str) -> str:
+    """Produce listing, social post, and marketing ad"""
+    product = json.loads(product_json)
+    llm = ChatOpenAI(
+        model_name="gpt-3.5-turbo", temperature=0.7,
+        openai_api_key=openai_api_key
+    )
+    prompt = f"""
+Generate three outputs for this product:
+
+Name: {product.get('name')}
+Differentiators: {product.get('differentiators')}
+Dimensions: {product.get('dimensions')}
+Overall Reviews: {product.get('overall_reviews')}
+
+1) Retail Listing Description (1–2 sentences)
+2) Social Media Post (short, engaging)
+3) Marketing Ad Copy (concise, persuasive)
+
+Return a JSON object with keys:
+"listing_description", "social_media_post", "marketing_ad"
+"""
+    response = llm([HumanMessage(content=prompt)])
+    return response.content
+
+# 6) Build the LangGraph Agent
+# Define the conversation state type
+State = TypedDict('State', {'messages': Annotated[list[AnyMessage], add_messages]})
+
+builder = StateGraph(State)
+# Node: Decide which retrieval tool to call
+def decide_node(state: State) -> dict:
+    last = state['messages'][-1].content.strip()
+    if last.isnumeric():
+        return {'product_id': last}
+    else:
+        return {'product_name': last}
+
+builder.add_node("decide", decide_node)
+# Conditional edges based on state keys
+builder.add_conditional_edges(
+    "decide",
+    (
+        lambda s: 'product_name' in s, 'by_name'),
+        (lambda s: 'product_id'   in s, 'by_id')
+)
+# Retrieval nodes
+builder.add_node("by_name", ToolNode(retrieve_products_by_name))
+builder.add_node("by_id",   ToolNode(retrieve_product_by_id))
+# Description generation
+builder.add_node("desc",   ToolNode(generate_descriptions))
+# Wiring edges
+builder.add_edge(START,    "decide")
+builder.add_edge("by_name","desc")  # after name search, feed list into description tool
+builder.add_edge("by_id",  "desc")
+builder.add_edge("desc",    END)
+
+agent = builder.compile()
+
+# 7) Helper to invoke the agent
+from langchain_core.messages import HumanMessage as HM
+
+def run_agent(user_input: str) -> str:
+    # Wrap initial message
+    messages = [HM(content=user_input)]
+    # Agent returns full history; last message is the tool output
+    history = agent.invoke(messages)
+    return history[-1].content  # generated_descriptions JSON
+
+# Example invocation
+print(run_agent("Wireless Mouse"))
+print(run_agent("12345"))
+
+
+
+# ======================================================
+# Streamlit App (app.py)
+# ======================================================
+# Save this as app.py and run `streamlit run app.py`
+
+import streamlit as st
+import json
+from databricks_langgraph_and_streamlit import retrieve_products_by_name, run_agent
+
+st.set_page_config(page_title="Inventory Description Generator")
+st.title("🛒 Product Description Generator")
+
+user_input = st.text_input("Enter product name or ID:")
+if st.button("Search / Generate"):
+    if user_input.isnumeric():
+        # Directly generate descriptions for ID
+        desc_json = run_agent(user_input)
+        desc = json.loads(desc_json)
+        st.subheader("Descriptions")
+        st.markdown(f"**Listing:** {desc['listing_description']}")
+        st.markdown(f"**Social Post:** {desc['social_media_post']}")
+        st.markdown(f"**Marketing Ad:** {desc['marketing_ad']}")
+    else:
+        # Lookup by name and let user select
+        items_json = retrieve_products_by_name(user_input)
+        items = json.loads(items_json)
+        options = {f"{i['product_id']} - {i['name']}": i['product_id'] for i in items}
+        choice = st.selectbox("Select a product", options.keys())
+        if st.button("Generate Descriptions"):
+            prod_id = options[choice]
+            desc_json = run_agent(str(prod_id))
+            desc = json.loads(desc_json)
+            st.subheader("Descriptions")
+            st.markdown(f"**Listing:** {desc['listing_description']}")
+            st.markdown(f"**Social Post:** {desc['social_media_post']}")
+            st.markdown(f"**Marketing Ad:** {desc['marketing_ad']}")

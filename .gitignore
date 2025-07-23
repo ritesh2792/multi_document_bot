@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+.env.*
+
+# Streamlit cache
+.streamlit/
+
+# VSCode
+.vscode/
+
+# Chroma store / embeddings / parquet (rebuildable artifacts)
+chroma_store/
+pdf_chunks.parquet
+embeddings.npy
+
+# OS
+.DS_Store
+Thumbs.db
